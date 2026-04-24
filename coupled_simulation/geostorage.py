@@ -327,13 +327,9 @@ class GeoStorage:
             # only needed for OPM Flow. ECLIPSE typically produces the header itself.
             if str(self.simulator).upper() == "OPM" and timestep > 1:
                 rst_file = os.path.join(
-                    self.working_dir_loc,
-                    f"{self.simulation_title_orig}_TSTEP_{timestep - 2}.X0000"
-                )
+                    self.working_dir_loc, f"{self.simulation_title_orig}_TSTEP_{timestep - 2}.X0000")
                 new_init_rst = os.path.join(
-                    self.working_dir_loc,
-                    f"{self.simulation_title_orig}_TSTEP_{timestep - 1}.X0000"
-                )
+                    self.working_dir_loc, f"{self.simulation_title_orig}_TSTEP_{timestep - 1}.X0000")
                 with open(rst_file, "rb") as fsrc, open(new_init_rst, "wb") as fdst:
                     fdst.write(fsrc.read())
 
@@ -342,35 +338,68 @@ class GeoStorage:
         if schedule_pos == -1:
             schedule_pos = util.search_section(ecl_data_file, "WCONPROD")
 
-        #print(schedule_pos)
-
         if schedule_pos > 0:
             # delete the old well schedule
             del ecl_data_file[schedule_pos:]
-            # append new well schedule
-            # first calculate rate applied for each well
-            well_count = len(self.well_names)
-            well_target = abs(flowrate / well_count) / self.reservoir_compartments
-            well_target_days = well_target * 60.0 * 60.0 *24.0
 
-            #now construct new well schedule section
-            #ecl_data_file.append('\n')
+            S_PER_DAY = 86400.0  # 60 * 60 * 24
+            use_gc = getattr(self, 'use_group_control', False)
+            well_count = len(self.well_names)
+            field_target_vol = abs(flowrate) * S_PER_DAY
+
+            # rate capacity warning checks: If the power plant asks higher mass flow rate
+            if hasattr(self, 'well_flowrate_capacity') and len(self.well_flowrate_capacity) > 0:
+                capacities = self.well_flowrate_capacity
+            else:
+                # safe fallback if the variable is missing
+                capacities = [0.0] * well_count
+                use_gc = False
+
+            if op_mode in ['charging', 'discharging'] and use_gc:
+                # calculate the absolute maximum the field can handle [Sm3/d]
+                total_max = sum((q * S_PER_DAY) / self.surface_density for q in capacities)
+
+                # only warn if the target is HIGHER than the total capacity
+                if field_target_vol > total_max:
+                    print(f"WARNING [Timestep {timestep}]: Target rate ({field_target_vol:.0f} Sm3/d) "
+                          f"exceeds total field capacity ({total_max:.0f} Sm3/d). "
+                          f"Simulator will clip the rate.")
 
             if op_mode == 'charging':
                 ecl_data_file.append("WCONINJE\n")
                 for idx, wname in enumerate(self.well_names):
+                    if use_gc:
+                        # well_max_flow_rate is in [kg/s] -> convert to [Sm3/d]
+                        well_rate = (self.well_flowrate_capacity[idx] * S_PER_DAY) / self.surface_density
+                    else:
+                        # split flowrate evenly if group control is off
+                        well_rate = field_target_vol / (well_count * self.reservoir_compartments)
                     ecl_data_file.append(
-                        f"'{wname}'\t'GAS'\t'OPEN'\t'RATE'\t"
-                        f"{well_target_days:.6f}\t1*\t{self.well_upper_BHP[idx]:.4f} /\n")
+                        f"'{self.well_names[idx]}'\t'GAS'\t'OPEN'\t'RATE'\t{well_rate:.6f}\t1*"
+                        f"\t{self.well_upper_BHP[idx]:.4f} /\n")
                 ecl_data_file.append('/\n')
+
+                if use_gc:
+                    ecl_data_file.append("GCONINJE\n")
+                    ecl_data_file.append(f"'FIELD'\t'GAS'\t'RATE'\t{field_target_vol:.2f}\t1*\t1*\t1*\t'YES' /\n/\n")
 
             elif op_mode == 'discharging':
                 ecl_data_file.append('WCONPROD\n')
                 for idx, wname in enumerate(self.well_names):
+                    if use_gc:
+                        well_rate = (self.well_flowrate_capacity[idx] * S_PER_DAY) / self.surface_density
+                        control_mode = 'GRUP'
+                    else:
+                        well_rate = field_target_vol / (well_count * self.reservoir_compartments)
+                        control_mode = 'GRAT'
                     ecl_data_file.append(
-                        f"'{wname}'\t'OPEN'\t'GRAT'\t1*\t1*\t"
-                        f"{well_target_days:.6f}\t1*\t1*\t{self.well_lower_BHP[idx]:.4f} /\n")
+                        f"'{wname}'\t'OPEN'\t'{control_mode}'\t1*\t1*\t"
+                        f"{well_rate:.6f}\t1*\t1*\t{self.well_lower_BHP[idx]:.4f} /\n")
+
                 ecl_data_file.append('/\n')
+                if getattr(self, 'use_group_control', False):
+                    ecl_data_file.append("GCONPROD\n")
+                    ecl_data_file.append(f"'FIELD'\t'GRAT'\t1*\t1*\t{field_target_vol:.4f}\t1*\t'RATE'\t'NO' /\n/\n")
 
             elif op_mode == 'shut-in' or op_mode == 'init':
                 ecl_data_file.append('WCONPROD\n')
@@ -384,18 +413,10 @@ class GeoStorage:
 
             ecl_data_file.append('/')
             #finish schedule
-            timestepsize_days = timestepsize / 60.0 / 60.0 / 24.0
-            file_finish = ['\n', '\n', 'TSTEP\n', '1*' + str(timestepsize_days) + '\n', '/\n', '\n', '\n', 'END\n' ]
+            timestepsize_days = timestepsize / S_PER_DAY
+            file_finish = ['\n', 'TSTEP\n', f"1*{timestepsize_days}\n", '/\n', '\n', 'END\n']
             ecl_data_file += file_finish
 
-
-            #save to new file
-            #if not op_mode == 'init':
-            #    temp_path = self.working_dir_loc + self.current_simulation_title + '.DATA'
-            #else:
-            #    #print('ini mode')
-            #    temp_path = self.working_dir_loc + self.simulation_title + '_init.DATA'
-            # temp_path = self.working_dir_loc + self.current_simulation_title + '.DATA'
             temp_path = os.path.join(self.working_dir_loc, f"{self.current_simulation_title}.DATA")
             util.write_file(temp_path, ecl_data_file)
 
